@@ -23,6 +23,7 @@ import torch
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -116,8 +117,6 @@ class HyenaLayer(GraphableMegatronModule):
         ``cuda_graph_scope`` captures the whole layer, while ``CudaGraphScope.mamba``
         can be used by callers that only want the recurrent/mixer scope.
         """
-        from megatron.core.transformer.cuda_graphs import CudaGraphManager  # lazy: heavy mcore import
-
         if not self.config.cuda_graph_scope or CudaGraphScope.mamba in (self.config.cuda_graph_scope or []):
             self.cudagraph_manager = CudaGraphManager(config)
 
@@ -141,6 +140,27 @@ class HyenaLayer(GraphableMegatronModule):
                 return bool(context.is_decode_only())
             return bool(context.using_cuda_graph_this_step())
         return False
+
+    def __call__(self, *args, **kwargs):
+        """Keep Evo2's real request-count shapes in distinct local CUDA graphs."""
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            inference_context = kwargs.get("inference_context")
+            cache_key = None
+            if (
+                inference_context is not None
+                and not inference_context.is_static_batching()
+                and hasattr(inference_context, "evo2_max_batched_decode_requests")
+            ):
+                active_request_count = int(inference_context.total_request_count) - int(
+                    inference_context.paused_request_count
+                )
+                cache_key = (
+                    inference_context.padded_batch_dimensions,
+                    active_request_count,
+                    bool(getattr(inference_context, "evo2_batched_decode_enabled", False)),
+                )
+            return self.cudagraph_manager(self, args, kwargs, cache_key=cache_key)
+        return super().__call__(*args, **kwargs)
 
     @property
     def bias_dropout_add_exec_handler(self):

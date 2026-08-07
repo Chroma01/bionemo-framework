@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import inspect
 import logging
 import os
@@ -35,6 +36,7 @@ from megatron.bridge.training.tokenizers.config import TokenizerConfig
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 
@@ -144,6 +146,12 @@ def determine_memory_requirement_and_skip_if_not_met(ckpt_name: str, test_name: 
                 "seq_len_cap": -1,
                 "memory_needed_by_test": 16,
             },  # checked both variants in isolation - needs ~21GB peak on L4
+            {
+                "test_name": "test_batch_generate_mbridge_evo2_batched_decode_accuracy",
+                "model_size": "evo2_1b_base",
+                "seq_len_cap": -1,
+                "memory_needed_by_test": 16,
+            },
             {
                 "test_name": "test_batch_generate_mbridge",
                 "model_size": "evo2_7b_base",
@@ -390,13 +398,15 @@ def test_forward_manual(
                 input_ids = torch.tensor(tokenizer.tokenize(partial_seq)).int().unsqueeze(0).to(device)
                 attention_mask = None
                 # when labels is None, the model returns logits
-                logits = model(
-                    input_ids=input_ids,
-                    position_ids=None,
-                    attention_mask=attention_mask,
-                    labels=None,
-                    **forward_kwargs,
-                )
+                inference_mode_context = InferenceMode.active() if flash_decode else contextlib.nullcontext()
+                with inference_mode_context:
+                    logits = model(
+                        input_ids=input_ids,
+                        position_ids=None,
+                        attention_mask=attention_mask,
+                        labels=None,
+                        **forward_kwargs,
+                    )
                 if flash_decode:
                     forward_kwargs["inference_context"].reset()
                 matchrate = _calc_matchrate(tokenizer=tokenizer, in_seq=partial_seq, logits=logits)
@@ -499,13 +509,15 @@ def test_forward_ckpt_conversion(
                 input_ids = torch.tensor(tokenizer.tokenize(partial_seq)).int().unsqueeze(0).to(device)
                 attention_mask = None
                 # when labels is None, the model returns logits
-                logits = model(
-                    input_ids=input_ids,
-                    position_ids=None,
-                    attention_mask=attention_mask,
-                    labels=None,
-                    **forward_kwargs,
-                )
+                inference_mode_context = InferenceMode.active() if flash_decode else contextlib.nullcontext()
+                with inference_mode_context:
+                    logits = model(
+                        input_ids=input_ids,
+                        position_ids=None,
+                        attention_mask=attention_mask,
+                        labels=None,
+                        **forward_kwargs,
+                    )
                 if flash_decode:
                     forward_kwargs["inference_context"].reset()
                 matchrate = _calc_matchrate(tokenizer=tokenizer, in_seq=partial_seq, logits=logits)
@@ -854,6 +866,89 @@ def test_batch_generate_mbridge(
         matchperc_print = [f"{mp:.1f}%" for mp in match_percents]
         matchperc_print_expected = [f"{ep:.1f}%" for ep in expected_matchpercents]
         assert all(mp >= 0.90 * ep for mp, ep in zip(match_percents, expected_matchpercents)), (
+            f"Expected at least 90% of {matchperc_print_expected=}, got {matchperc_print=}"
+        )
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.slow
+@pytest.mark.skipif(bool(os.environ.get("CI")), reason="Skip in CI due to disk space")
+def test_batch_generate_mbridge_evo2_batched_decode_accuracy(sequences: list[str], tmp_path: Path):
+    """Same-length opt-in batched decode should preserve second-half completion accuracy.
+
+    This drives several prompts in one ``generate()`` call with ``evo2_batched_decode_size > 1`` so
+    the Evo2 Hyena recurrent state is bound for multiple active requests at the same decode step.
+    """
+    from bionemo.evo2.run.infer import generate, setup_inference_engine
+
+    ckpt_name = "evo2/1b-8k-bf16:1.0"
+    # The opt-in batched decode path requires same-length prompts. These golden values are for the
+    # shared 2048-token prefix used here, not the variable-length midpoint prompts in
+    # test_batch_generate_mbridge.
+    expected_matchpercents = [45.2, 56.8, 41.4, 100.0]
+    _ = determine_memory_requirement_and_skip_if_not_met(
+        ckpt_name, test_name="test_batch_generate_mbridge_evo2_batched_decode_accuracy"
+    )
+
+    num_tokens_to_generate = 500
+    prompt_len = min(len(seq) // 2 for seq in sequences)
+    prompt_len = min(prompt_len, 2048)
+    prompts = [seq[:prompt_len] for seq in sequences]
+    targets = [seq[prompt_len : prompt_len + num_tokens_to_generate] for seq in sequences]
+    batch_size = len(prompts)
+
+    with distributed_model_parallel_state(), torch.no_grad():
+        nemo2_ckpt_path = load(ckpt_name)
+        mbridge_ckpt_dir = run_nemo2_to_mbridge(
+            nemo2_ckpt_dir=nemo2_ckpt_path,
+            tokenizer_path=DEFAULT_HF_TOKENIZER_MODEL_PATH_512,
+            mbridge_ckpt_dir=tmp_path / "mbridge_checkpoint",
+            model_size="evo2_1b_base",
+            seq_length=8192,
+            mixed_precision_recipe="bf16_mixed",
+            vortex_style_fp8=False,
+        )
+        mbridge_ckpt_path = mbridge_ckpt_dir / "iter_0000001"
+
+        batched_components = setup_inference_engine(
+            ckpt_dir=mbridge_ckpt_path,
+            max_seq_length=8192,
+            max_batch_size=batch_size,
+            tensor_parallel_size=1,
+            random_seed=42,
+            mixed_precision_recipe="bf16_mixed",
+            vortex_style_fp8=False,
+        )
+        batched_results = generate(
+            batched_components,
+            prompts=prompts,
+            max_new_tokens=num_tokens_to_generate,
+            temperature=1.0,
+            top_k=1,
+            evo2_batched_decode_size=batch_size,
+        )
+
+        batched_texts = [result.generated_text if result else "" for result in batched_results]
+        assert len(batched_texts) == len(targets)
+
+        batched_match_percents = [
+            calculate_sequence_identity(target, generated_text) or 0.0
+            for target, generated_text in zip(targets, batched_texts)
+        ]
+        assert len(batched_match_percents) == len(expected_matchpercents)
+        for i, (match_percent, expected_matchpercent) in enumerate(
+            zip(batched_match_percents, expected_matchpercents)
+        ):
+            logger.info(
+                "evo2 batched decode seq[%d] identity: %.1f%% expected: %.1f%%",
+                i,
+                match_percent,
+                expected_matchpercent,
+            )
+
+        matchperc_print = [f"{mp:.1f}%" for mp in batched_match_percents]
+        matchperc_print_expected = [f"{ep:.1f}%" for ep in expected_matchpercents]
+        assert all(mp >= 0.90 * ep for mp, ep in zip(batched_match_percents, expected_matchpercents)), (
             f"Expected at least 90% of {matchperc_print_expected=}, got {matchperc_print=}"
         )
 
