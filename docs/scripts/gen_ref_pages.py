@@ -59,8 +59,9 @@ SUPPORT_FILE_SUFFIXES = {
     ".yml",
 }
 SUPPORT_FILE_NAMES = {"Dockerfile", "LICENSE", "Makefile", "requirements.txt"}
-SKIP_SUPPORT_DIRS = {"assets", "examples", "notebooks", ".venv", "__pycache__", ".pytest_cache"}
+SKIP_SUPPORT_DIRS = {"assets", "examples", "notebooks", "results", ".venv", "__pycache__", ".pytest_cache"}
 GITHUB_BLOB_BASE = "https://github.com/NVIDIA-BioNeMo/bionemo-framework/blob/main"
+GITHUB_TREE_BASE = "https://github.com/NVIDIA-BioNeMo/bionemo-framework/tree/main"
 
 
 def _rewrite_relative_links(
@@ -76,6 +77,8 @@ def _rewrite_relative_links(
       are rewritten relative to the generated ``main/recipes/`` docs tree.
     * Paths from imported READMEs to examples, notebooks, and assets are
       rewritten to the generated docs locations where those files are copied.
+    * Hidden recipe paths and canonical skill trees, which are not published in the docs tree,
+      are rewritten to their canonical GitHub locations.
 
     All other relative links (e.g. to ``ci/scripts/``) are left untouched.
 
@@ -176,6 +179,12 @@ def _rewrite_relative_links(
                     rel_to_recipe_root = resolved.relative_to(recipe_root)
                 except ValueError:
                     continue
+
+                is_skill_tree = len(rel_to_recipe_root.parts) >= 2 and rel_to_recipe_root.parts[1] == "skills"
+                if is_skill_tree or any(part.startswith(".") for part in rel_to_recipe_root.parts):
+                    repo_rel = resolved.relative_to(root).as_posix()
+                    github_base = GITHUB_TREE_BASE if trailing_slash or resolved.is_dir() else GITHUB_BLOB_BASE
+                    return f"{github_base}/{repo_rel}" + suffix
 
                 if resolved.suffix == ".md" and "src" in rel_to_recipe_root.parts:
                     repo_rel = resolved.relative_to(root).as_posix()
@@ -373,7 +382,7 @@ def write_generated_tutorials_index() -> None:
 
 
 def copy_docs_from_dir(source_dir: Path, dest_dir: Path, root: Path, log_prefix: str) -> list[Path]:
-    """Copy Markdown and notebook files from a directory tree.
+    """Copy documentation and its support files from a directory tree.
 
     Args:
         source_dir (Path): Directory containing documentation files.
@@ -388,10 +397,17 @@ def copy_docs_from_dir(source_dir: Path, dest_dir: Path, root: Path, log_prefix:
     has_directory_index = False
 
     for path in sorted(source_dir.rglob("*")):
-        if not path.is_file() or path.suffix not in {".md", ".ipynb"}:
+        if not path.is_file():
             continue
 
-        dest_file = dest_dir / path.relative_to(source_dir)
+        relative_path = path.relative_to(source_dir)
+        dest_file = dest_dir / relative_path
+        if path.suffix not in {".md", ".ipynb"}:
+            if _should_copy_support_file(relative_path):
+                copy_binary_file(path, dest_file, f"{log_prefix}: {dest_file}")
+            continue
+        if path.name == "README.md":
+            dest_file = dest_file.with_name("index.md")
         if dest_file.parent == dest_dir and dest_file.name in {"index.md", "README.md"}:
             has_directory_index = True
 

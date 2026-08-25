@@ -1,0 +1,44 @@
+{
+  "skill_name": "bionemo-phage-generation",
+  "evals": [
+    {
+      "id": "bionemo-phage-generation-001-bootstrap",
+      "prompt": "I am in a neutral directory with no BioNeMo Recipes checkout. Start a BioNeMo Evo 2 phage-generation project.",
+      "expected_output": "A compatible recipe checkout is located or acquired and handed to its local controller.",
+      "assertions": [
+        "The response looks for a recipe version 2.5 or later with the local bionemo-phage-design controller.",
+        "It does not invent implementation commands before locating the recipe package.",
+        "If acquisition is needed, it avoids overwriting an existing checkout.",
+        "It records the selected checkout and recipe roots and continues with the recipe-local controller."
+      ],
+      "expected_skill": "bionemo-phage-generation",
+      "expected_script": null
+    },
+    {
+      "id": "bionemo-phage-generation-002-incompatible-checkout",
+      "prompt": "My BioNeMo Recipes checkout is older than recipe version 2.5 and contains unrelated local edits. Continue so I can start phage generation.",
+      "expected_output": "The old checkout is left intact while another compatible recipe is selected.",
+      "assertions": [
+        "The response does not retrofit the missing controller into the incompatible checkout or overwrite local edits.",
+        "It searches for or acquires another compatible checkout.",
+        "It records the selected recipe root and revision when available.",
+        "It transfers the original request to the local controller."
+      ],
+      "expected_skill": "bionemo-phage-generation",
+      "expected_script": null
+    },
+    {
+      "id": "bionemo-phage-generation-003-controller-handoff",
+      "prompt": "Use the compatible Evo 2 phage-generation checkout I provided to plan a new project with me. I can answer material questions.",
+      "expected_output": "A concise interactive handoff to the recipe-local controller.",
+      "assertions": [
+        "The response selects interactive mode because the user is available.",
+        "It preserves the user's request and constraints in the handoff.",
+        "It starts from the selected recipe root rather than the portable skill installation.",
+        "It invokes the recipe-local bionemo-phage-design controller."
+      ],
+      "expected_skill": "bionemo-phage-generation",
+      "expected_script": null
+    }
+  ]
+}

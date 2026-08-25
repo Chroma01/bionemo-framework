@@ -20,11 +20,12 @@
 #
 # Destination files that support comments (e.g. .py) get a banner inserted after the license block indicating they are
 # copies and linking back to the source file.
+#
+# Directory mappings are exact recursive mirrors. With --fix, each destination directory is replaced with a fresh copy
+# of the source directory, so files deleted or moved in the source are also removed from every destination.
 
 import argparse
-import functools
 import logging
-import operator
 import shutil
 from pathlib import Path
 
@@ -160,9 +161,46 @@ def _iter_copied_tree_files(source_path: Path):
         yield file
 
 
+def _sync_copied_tree(source_path: Path, destination_path: Path) -> None:
+    """Replace *destination_path* with a fresh recursive copy of *source_path*."""
+    if destination_path.is_symlink() or destination_path.is_file():
+        destination_path.unlink()
+    elif destination_path.exists():
+        shutil.rmtree(destination_path)
+    shutil.copytree(source_path, destination_path)
+
+
+def _relative_tree_files(root: Path) -> set[Path]:
+    """Return copied-tree files relative to *root*."""
+    return {file.relative_to(root) for file in _iter_copied_tree_files(root)}
+
+
+def _validate_copied_tree(source_path: Path, destination_path: Path, source_display: str) -> None:
+    """Validate that a copied directory has the source inventory and contents."""
+    source_files = _relative_tree_files(source_path)
+    destination_files = _relative_tree_files(destination_path)
+    if source_files != destination_files:
+        missing = sorted(str(path) for path in source_files - destination_files)
+        unexpected = sorted(str(path) for path in destination_files - source_files)
+        raise ValueError(
+            f"Copied directory {destination_path} does not exactly mirror {source_path}; "
+            f"missing={missing}, unexpected={unexpected}. Run "
+            f"{Path(__file__).relative_to(Path.cwd())} --fix to fix."
+        )
+    for source_rel in source_files:
+        _compare_file_contents(source_path / source_rel, destination_path / source_rel, source_display)
+
+
 SOURCE_TO_DESTINATION_MAP: dict[str, list[str]] = {
     "recipes/evo2_megatron/src/bionemo/common": [
         "recipes/eden_megatron/src/bionemo/common",
+        "recipes/evo2_phage_gen/src/bionemo/common",
+    ],
+    "recipes/evo2_megatron/src/bionemo/evo2": [
+        "recipes/evo2_phage_gen/src/bionemo/evo2",
+    ],
+    "recipes/evo2_megatron/tokenizers": [
+        "recipes/evo2_phage_gen/tokenizers",
     ],
     "models/esm2/modeling_esm_te.py": [
         "recipes/esm2_native_te/modeling_esm_te.py",
@@ -238,10 +276,14 @@ def main():
     args = parser.parse_args()
 
     # Check if the script needs to run.
-    all_files = set(SOURCE_TO_DESTINATION_MAP.keys()) | set(
-        functools.reduce(operator.iadd, SOURCE_TO_DESTINATION_MAP.values(), [])
-    )
-    relevant_files = [f for f in args.files if f in all_files]
+    mapped_paths = {
+        Path(path) for source, destinations in SOURCE_TO_DESTINATION_MAP.items() for path in (source, *destinations)
+    }
+    relevant_files = [
+        filename
+        for filename in args.files
+        if any(Path(filename) == mapped_path or mapped_path in Path(filename).parents for mapped_path in mapped_paths)
+    ]
     # If pre-commit passed a list of files and none are relevant, skip.
     if args.files and not relevant_files:
         return
@@ -264,7 +306,7 @@ def main():
 
             if args.fix:
                 if source_path.is_dir():
-                    shutil.copytree(source, destination, dirs_exist_ok=True)
+                    _sync_copied_tree(source_path, destination_path)
                     for file in _iter_copied_tree_files(source_path):
                         source_rel = file.relative_to(source_path)
                         _add_banner_to_file(destination_path / source_rel, str(Path(source) / source_rel))
@@ -275,9 +317,7 @@ def main():
 
             else:
                 if source_path.is_dir():
-                    for file in _iter_copied_tree_files(source_path):
-                        source_rel = file.relative_to(source_path)
-                        _compare_file_contents(file, destination_path / source_rel, source)
+                    _validate_copied_tree(source_path, destination_path, source)
                 else:
                     _compare_file_contents(source_path, destination_path, source)
 

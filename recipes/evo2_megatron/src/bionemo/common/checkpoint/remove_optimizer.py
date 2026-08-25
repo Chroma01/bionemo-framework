@@ -15,10 +15,12 @@
 
 """Remove optimizer state from an MBridge DCP checkpoint.
 
-Reads a Megatron Bridge checkpoint (which may contain model weights, optimizer
-state, LR scheduler state, and RNG state), strips everything except model
-weights, and writes a new checkpoint.  The result is a smaller checkpoint
-suitable for release or fine-tuning.
+Reads a Megatron Bridge checkpoint (which may contain model state, optimizer
+state, LR scheduler state, and RNG state), strips non-model training state,
+and writes a new checkpoint. By default the existing weights-only behavior
+also omits serialized model objects. Callers that need a schema-complete native
+MBridge checkpoint may opt in to preserving objects such as Transformer Engine
+``_extra_state``.
 
 This module depends only on PyTorch and the standard library -- it must NOT
 import megatron, nemo, or mbridge.
@@ -31,10 +33,11 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
+from torch.distributed.checkpoint import DefaultLoadPlanner, DefaultSavePlanner, FileSystemReader, FileSystemWriter
 from torch.distributed.checkpoint.metadata import BytesStorageMetadata
 
 
@@ -65,12 +68,17 @@ def _is_optimizer_key(key: str) -> bool:
 def remove_optimizer(
     src_ckpt_dir: Path,
     dst_ckpt_dir: Path,
+    *,
+    preserve_model_object_state: bool = False,
 ) -> Path:
     """Strip optimizer / scheduler / RNG state from an MBridge checkpoint.
 
     Args:
         src_ckpt_dir: Source checkpoint root (contains ``iter_NNNNNNN/``).
         dst_ckpt_dir: Destination directory.  Must not already exist.
+        preserve_model_object_state: Retain non-optimizer DCP object shards such as
+            Transformer Engine ``_extra_state``. Defaults to ``False`` to preserve
+            the reducer's historical weights-only behavior.
 
     Returns:
         Path to the destination checkpoint directory.
@@ -86,31 +94,62 @@ def remove_optimizer(
     dst_iter_dir = dst_ckpt_dir / iter_name
     dst_iter_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- 1. Load only model-weight tensors from DCP ---
+    # --- 1. Load only model state from DCP ---
     reader = FileSystemReader(str(src_iter_dir))
     metadata = reader.read_metadata()
 
-    state_dict: dict[str, torch.Tensor] = {}
+    state_dict: dict[str, Any] = {}
+    model_object_keys: set[str] = set()
     skipped_keys: list[str] = []
     for key, item_meta in metadata.state_dict_metadata.items():
-        if isinstance(item_meta, BytesStorageMetadata):
-            skipped_keys.append(key)
-            continue
         if _is_optimizer_key(key):
             skipped_keys.append(key)
+        elif isinstance(item_meta, BytesStorageMetadata):
+            if preserve_model_object_state:
+                # DCP replaces this metadata placeholder with the deserialized object during load.
+                state_dict[key] = item_meta
+                model_object_keys.add(key)
+            else:
+                skipped_keys.append(key)
         else:
             state_dict[key] = torch.empty(item_meta.size, dtype=item_meta.properties.dtype, device="cpu")
 
-    logger.info(f"Loading {len(state_dict)} model-weight keys (skipping {len(skipped_keys)} optimizer/other keys)")
+    retained_kind = "model-state" if preserve_model_object_state else "model-weight"
+    logger.info(f"Loading {len(state_dict)} {retained_kind} keys (skipping {len(skipped_keys)} other keys)")
     if skipped_keys:
         logger.debug(f"Skipped keys (first 20): {skipped_keys[:20]}")
 
-    dcp.load(state_dict=state_dict, storage_reader=reader, no_dist=True)
+    # The mapping is deliberately flat and uses the source metadata FQNs as exact
+    # keys. Disabling planner flattening keeps serialized objects such as TE
+    # ``_extra_state`` under those keys even when an object contains tensors.
+    dcp.load(
+        state_dict=state_dict,
+        storage_reader=reader,
+        planner=DefaultLoadPlanner(flatten_state_dict=False, flatten_sharded_tensors=False),
+        no_dist=True,
+    )
 
     # --- 2. Save model-only state dict to destination ---
     writer = FileSystemWriter(str(dst_iter_dir), single_file_per_rank=False, thread_count=os.cpu_count())
-    dcp.save(state_dict=state_dict, storage_writer=writer, no_dist=True)
+    dcp.save(
+        state_dict=state_dict,
+        storage_writer=writer,
+        planner=DefaultSavePlanner(flatten_state_dict=False, flatten_sharded_tensors=False),
+        no_dist=True,
+    )
+    expected_keys = set(state_dict)
     del state_dict
+
+    written_metadata = FileSystemReader(str(dst_iter_dir)).read_metadata().state_dict_metadata
+    if set(written_metadata) != expected_keys:
+        missing = sorted(expected_keys - set(written_metadata))
+        unexpected = sorted(set(written_metadata) - expected_keys)
+        raise RuntimeError(f"Model-only checkpoint state mismatch: missing={missing}, unexpected={unexpected}")
+    changed_object_keys = [
+        key for key in model_object_keys if not isinstance(written_metadata[key], BytesStorageMetadata)
+    ]
+    if changed_object_keys:
+        raise RuntimeError(f"Model object state was not preserved as object storage: {sorted(changed_object_keys)}")
 
     # --- 3. Copy non-DCP artefacts (run_config, tokenizer, train_state, etc.) ---
     for name in ("run_config.yaml", "train_state.pt"):
@@ -165,7 +204,7 @@ def main():
     """CLI entry point for removing optimizer state from an MBridge checkpoint."""
     parser = argparse.ArgumentParser(
         description="Remove optimizer state from a Megatron Bridge DCP checkpoint, "
-        "producing a smaller weights-only checkpoint."
+        "producing a smaller weights-only checkpoint by default."
     )
     parser.add_argument(
         "--src-ckpt-dir",
@@ -177,13 +216,22 @@ def main():
         "--dst-ckpt-dir",
         type=Path,
         required=True,
-        help="Destination directory for the weights-only checkpoint",
+        help="Destination directory for the reduced checkpoint",
+    )
+    parser.add_argument(
+        "--preserve-model-object-state",
+        action="store_true",
+        help="Retain non-optimizer serialized model objects such as Transformer Engine _extra_state",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
-    remove_optimizer(args.src_ckpt_dir, args.dst_ckpt_dir)
+    remove_optimizer(
+        args.src_ckpt_dir,
+        args.dst_ckpt_dir,
+        preserve_model_object_state=args.preserve_model_object_state,
+    )
 
 
 if __name__ == "__main__":

@@ -69,6 +69,21 @@ torchrun --nproc-per-node 2 --no-python \
   --use-subquadratic-ops
 ```
 
+### Checkpoint retention
+
+`--most-recent-k K` keeps the latest K checkpoints; `-1` leaves all cleanup to
+the operator. To retain validation-selected checkpoints as well as a resume point,
+add flags such as:
+
+```bash
+--eval-interval 20 --save-interval 100 \
+  --keep-best-k 3 --most-recent-k 1 \
+  --checkpoint-metric-name "lm loss" --checkpoint-metric-mode min --strict-checkpoint-metric \
+  --checkpoint-metric-step-tolerance 1
+```
+
+With best-K enabled, the save interval must be a multiple of the validation interval. The callback assigns the closest already-recorded metric when each checkpoint is saved, writes all scalar validation results to `validation_metrics.json`, and records the chosen assignments in `checkpoint_metrics.json`; its `best_checkpoint` field points to the selected relative checkpoint directory. By default, missing matches warn and use recent-K retention; `--strict-checkpoint-metric` stops instead and reports the raw validation keys. TensorBoard adds a ` validation` suffix to those raw keys. Checkpoints that predate newly enabled tracking are left in place as historical unscored checkpoints.
+
 > **Tip:** The `--use-subquadratic-ops` flag enables fused subquadratic-ops
 > CUDA kernels (`b2b_causal_conv1d` for proj+mixer fusion in prefill,
 > `fft_causal_conv1d` / `causal_conv1d` inside `engine.parallel_fir`). It
@@ -178,6 +193,10 @@ The tool automatically finds the latest `iter_*` directory, strips optimizer and
 scheduler state from the DCP files, and copies model weights, tokenizer, and
 config files to the destination. The resulting checkpoint is directly usable
 with `--finetune-ckpt-dir` or the export tools.
+
+By default, the historical weights-only behavior also omits serialized model-object
+shards. Pass `--preserve-model-object-state` when a downstream native MBridge loader
+needs objects such as Transformer Engine `_extra_state`.
 
 ## Fine-tuning from an existing checkpoint
 

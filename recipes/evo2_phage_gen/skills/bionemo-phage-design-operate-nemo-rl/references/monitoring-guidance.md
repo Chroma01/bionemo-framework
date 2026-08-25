@@ -1,0 +1,15 @@
+# RL monitoring guidance
+
+Run training through a facility whose worker, status, and logs survive the chat process. Retain a stable job identifier, observe startup and early progress, then check meaningful progress until the facility reports terminal success or failure. Reattach to a live job after a new session instead of launching a duplicate.
+
+Treat training rollouts as scientific on-policy observations, not merely optimizer diagnostics. When training and validation differ only by prompts or seeds, both describe candidate quality; the fixed validation bank provides stable longitudinal comparison rather than a biological-label holdout. Read both streams together.
+
+At each training step and comparable validation event, report prompt composition and stratum counts, component means and support/denominators, measurement availability and failures, safety states, hard-QC yield, raw and 99%-clustered diversity, copying, and uncertainty. Inspect prompt-cohort cycles before attributing a sawtooth pattern to policy learning. A positive aggregate must not hide an inactive component.
+
+Discover and record the emitted metric keys and task namespace from the installed runtime. Do not guess names or require a parent framework to know child-owned metrics before they are emitted.
+
+Do not apply the SFT rule to RL. Select checkpoints from sustained, meaningful fixed-bank improvement corroborated by rolling training-rollout behavior. With validation every 10 steps, ordinarily require approximately ten comparable validation events—about 100 optimizer steps—after an apparent decline begins before calling it sustained; rescale the event count when cadence changes. This is an evidence horizon, not an automatic countdown, and requires stable prompt composition, objective semantics, support, and measurement availability.
+
+A single sharp drop, several low intervals, or a short plateau does not justify stopping; noisy RL may recover after a long excursion. Treat low safety scores as learning evidence, not an operational stop condition, when their measurements are valid. Distinguish valid zero, FAIL, INDETERMINATE, or explicit inapplicability from missing or unexplained NOT_RUN values and failure to execute an enabled scorer. Enter `diagnose` promptly for the latter and hold at a usable checkpoint only when further updates would be uninterpretable; diagnosis proceeds autonomously rather than waiting for acknowledgment by default.
+
+Persist `continue`, `diagnose`, `stop`, or `restart` plus its window, uncertainty, component support, and rationale at each fixed-bank event. Continue long enough to distinguish prompt composition, temporary degradation, and rebound within the approved ceiling. Once comparable validation windows and training rollouts corroborate a material decline for roughly the decision horizon without recovery, stop pushing that trajectory, diagnose its onset, and choose a compatible healthy-checkpoint restart or a versioned new attempt. Preserve the latest resumable checkpoint and the best scientific checkpoint.
