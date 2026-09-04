@@ -15,6 +15,7 @@
 
 """Tests for model provider instantiation, naming, and checkpoint converters."""
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import sentinel
@@ -31,8 +32,10 @@ from bionemo.evo2.models.evo2_provider import (
     Hyena1bModelProvider,
     HyenaTestModelProvider,
     _patch_megatron_dataset_helper_compile,
+    bind_hyena_packed_views_to_static_context,
     build_evo2_mamba_inference_state_config,
     infer_model_type,
+    reset_hyena_packed_views_for_new_request,
 )
 from bionemo.evo2.utils.checkpoint.mbridge_to_vortex import _split_fc1, mbridge_to_vortex_state_dict
 from bionemo.evo2.utils.checkpoint.savanna_to_mbridge import load_savanna_state_dict, savanna_to_mbridge_state_dict
@@ -70,6 +73,89 @@ def test_hyena_provider_leaves_te_context_parallel_transport_unset():
     assert HyenaTestModelProvider(cp_comm_type=per_layer).cp_comm_type is per_layer
 
 
+@pytest.mark.parametrize(
+    ("device_capability", "configured_backend", "expected_fa4"),
+    [
+        ((8, 0), evo2_provider.AttnBackend.flash, False),
+        ((8, 6), evo2_provider.AttnBackend.flash, False),
+        ((8, 9), evo2_provider.AttnBackend.flash, False),
+        ((8, 9), evo2_provider.AttnBackend.fused, False),
+        ((8, 9), evo2_provider.AttnBackend.auto, False),
+        ((9, 0), evo2_provider.AttnBackend.flash, True),
+    ],
+)
+def test_fa4_backend_respects_supported_device_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    device_capability: tuple[int, int],
+    configured_backend,
+    expected_fa4: bool,
+):
+    """FA4 remains enabled on Hopper while SM8x keeps flash dispatch through FA2."""
+    from megatron.core.transformer import attention as mcore_attention
+    from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils
+
+    provider = SimpleNamespace(attention_backend=configured_backend)
+    monkeypatch.setattr(mcore_attention, "HAVE_FA4", True)
+    monkeypatch.setattr(FlashAttentionUtils, "v4_is_installed", True)
+
+    evo2_provider._configure_fa4_for_device(provider, device_capability=device_capability)
+
+    assert provider.attention_backend is configured_backend
+    assert mcore_attention.HAVE_FA4 is expected_fa4
+    assert FlashAttentionUtils.v4_is_installed is expected_fa4
+
+
+def test_fa4_backend_falls_back_without_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    from megatron.core.transformer import attention as mcore_attention
+
+    provider = SimpleNamespace(attention_backend=evo2_provider.AttnBackend.flash)
+    monkeypatch.setattr(mcore_attention, "HAVE_FA4", True)
+    monkeypatch.setattr(evo2_provider.torch.cuda, "is_available", lambda: False)
+
+    assert evo2_provider._configure_fa4_for_device(provider) is False
+    assert provider.attention_backend is evo2_provider.AttnBackend.flash
+    assert mcore_attention.HAVE_FA4 is False
+
+
+def test_sm89_disables_te_fa4_independently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MCore disabling FA4 must not leave TE free to select it on SM89."""
+    from megatron.core.transformer import attention as mcore_attention
+    from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils
+
+    provider = SimpleNamespace(attention_backend=evo2_provider.AttnBackend.flash)
+    monkeypatch.setattr(mcore_attention, "HAVE_FA4", False)
+    monkeypatch.setattr(FlashAttentionUtils, "v4_is_installed", True)
+
+    assert evo2_provider._configure_fa4_for_device(provider, device_capability=(8, 9)) is False
+    assert provider.attention_backend is evo2_provider.AttnBackend.flash
+    assert FlashAttentionUtils.v4_is_installed is False
+
+
+def test_fa4_selection_clears_derived_te_backend_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inherited TE selectors cannot override the provider-selected backend."""
+    from megatron.core.models.common.language_module.language_module import LanguageModule
+    from megatron.core.transformer import attention as mcore_attention
+    from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils
+
+    provider = SimpleNamespace(attention_backend=evo2_provider.AttnBackend.flash)
+    monkeypatch.setattr(mcore_attention, "HAVE_FA4", True)
+    monkeypatch.setattr(FlashAttentionUtils, "v4_is_installed", True)
+    for variable in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+        monkeypatch.setenv(variable, "1")
+
+    assert evo2_provider._configure_fa4_for_device(provider, device_capability=(8, 9)) is False
+
+    assert provider.attention_backend is evo2_provider.AttnBackend.flash
+    assert FlashAttentionUtils.v4_is_installed is False
+    assert all(variable not in os.environ for variable in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"))
+
+    LanguageModule._set_attention_backend(SimpleNamespace(config=provider))
+
+    assert os.environ["NVTE_FLASH_ATTN"] == "1"
+    assert os.environ["NVTE_FUSED_ATTN"] == "0"
+    assert os.environ["NVTE_UNFUSED_ATTN"] == "0"
+
+
 @pytest.mark.parametrize(("requested", "expected"), [(None, "p2p"), ("p2p", "p2p"), ("a2a", "a2a")])
 def test_configure_runtime_context_parallel_comm_type(requested: str | None, expected: str):
     """Runtime selection defaults to P2P and overrides stale checkpoint metadata."""
@@ -86,6 +172,44 @@ def test_configure_runtime_context_parallel_comm_type_rejects_unknown_transport(
 
     with pytest.raises(ValueError, match="context-parallel communication type"):
         evo2_provider.configure_runtime_context_parallel_comm_type(provider, "all_gather")
+
+
+def test_static_hyena_state_binding_keeps_graph_stable_full_rings() -> None:
+    """Static prefill copies even short FIR tails into persistent full-ring views."""
+    shapes = SimpleNamespace(
+        conv_shape=(6, 2),
+        conv_owner_id=101,
+        ssm_shape=(2, 4),
+        ssm_kind="inner_fir",
+        ssm_owner_id=202,
+    )
+    layer = SimpleNamespace(
+        mixer=SimpleNamespace(hyena_state_shapes_per_request=lambda: shapes),
+    )
+    decoder = SimpleNamespace(
+        layers=[layer],
+        hyena_state_shapes_per_request=lambda: ((6, 2), (2, 4), [shapes]),
+    )
+    model = SimpleNamespace(decoder=decoder)
+    context = SimpleNamespace()
+
+    bind_hyena_packed_views_to_static_context(model, context, batch_size=2, device=torch.device("cpu"))
+    projection_tail = torch.arange(12, dtype=torch.float32).reshape(2, 6, 1)
+    context.fir_filter_state_dict[101] = projection_tail
+
+    first_view = context.fir_filter_state_dict[101]
+    assert first_view.shape == (2, 6, 2)
+    torch.testing.assert_close(first_view[..., 0], torch.zeros(2, 6))
+    torch.testing.assert_close(first_view[..., 1:], projection_tail)
+    first_ptr = first_view.data_ptr()
+
+    reset_hyena_packed_views_for_new_request(context)
+    assert 101 not in context.fir_filter_state_dict
+    assert torch.count_nonzero(context._evo2_hyena_conv_states) == 0
+
+    context.fir_filter_state_dict[101] = torch.full((2, 6, 2), 7.0)
+    assert context.fir_filter_state_dict[101].data_ptr() == first_ptr
+    torch.testing.assert_close(context.fir_filter_state_dict[101], torch.full((2, 6, 2), 7.0))
 
 
 def test_infer_model_type_hyena():
