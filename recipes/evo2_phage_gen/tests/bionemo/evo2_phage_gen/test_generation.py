@@ -15,21 +15,29 @@
 
 """Tests for ``bionemo.evo2_phage_gen.generation``."""
 
+import argparse
 import csv
 import json
+import subprocess
+import sys
 
 import pytest
 import torch
 
+from bionemo.evo2_phage_gen import generation, rollout_evidence
 from bionemo.evo2_phage_gen.generation import (
+    PromptAnchor,
+    circular_prompt,
     collect_sft_likelihoods,
     ensure_paper_useful_rl_prompt_files,
     finalize_ranked_rollout,
     infer_jsonl_to_fasta,
+    parse_prompt_anchor,
     phix174_prompts,
     write_inference_prompt_shards,
     write_prompt_sweep_jsonl,
     write_rl_prompt_bank,
+    write_rotated_reference_fasta,
     write_sft_likelihood_fasta,
 )
 
@@ -100,6 +108,170 @@ def test_write_rl_prompt_bank_supports_exact_nondivisible_record_count(tmp_path)
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert [len(row["messages"][0]["content"]) - 2 for row in records] == [4, 6, 8, 4, 6]
     assert len({row["id"] for row in records}) == 5
+
+
+def test_circular_prompt_extracts_named_origin_wrapping_anchor():
+    anchor = PromptAnchor(name="wrap", start_1_based=7)
+
+    assert circular_prompt("AAAACCGG", anchor, 4) == "+~GGAA"
+
+
+def test_circular_prompt_validates_boundaries_and_invalid_anchors():
+    assert circular_prompt("AAAACCGG", PromptAnchor("last", 8), 8) == "+~GAAAACCG"
+    with pytest.raises(ValueError, match="must not be empty"):
+        circular_prompt("", PromptAnchor("origin", 1), 1)
+    with pytest.raises(ValueError, match="beyond reference length"):
+        circular_prompt("ACGT", PromptAnchor("past_end", 5), 1)
+    with pytest.raises(ValueError, match="between 0 and reference length"):
+        circular_prompt("ACGT", PromptAnchor("origin", 1), 5)
+    with pytest.raises(ValueError, match="Invalid prompt anchor name"):
+        PromptAnchor("not safe", 1)
+    with pytest.raises(ValueError, match="positive 1-based"):
+        PromptAnchor("origin", 0)
+    with pytest.raises(argparse.ArgumentTypeError, match="NAME:START"):
+        parse_prompt_anchor("origin")
+
+
+def test_write_rl_prompt_bank_balances_anchor_and_length_in_each_update(tmp_path):
+    output = write_rl_prompt_bank(
+        tmp_path / "train.jsonl",
+        prompt_lengths=[2, 4],
+        num_records=96,
+        prompt_anchors=[
+            PromptAnchor("origin", 1),
+            PromptAnchor("before_g", 5),
+            PromptAnchor("after_h", 9),
+            PromptAnchor("a_cluster_start", 13),
+        ],
+        reference_sequence="AAAACCCCGGGGTTTT",
+        id_prefix="train",
+    )
+
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    strata = [row["id"].rsplit("-", 1)[0].removeprefix("train-") for row in records]
+    assert len(records) == 96
+    assert {stratum: strata.count(stratum) for stratum in set(strata)} == {
+        f"{anchor}-p{length}": 12
+        for length in (2, 4)
+        for anchor in ("origin", "before_g", "after_h", "a_cluster_start")
+    }
+    for start in range(0, len(records), 16):
+        update = strata[start : start + 16]
+        assert {stratum: update.count(stratum) for stratum in set(update)} == {stratum: 2 for stratum in set(strata)}
+        expanded = [stratum for stratum in update for _ in range(16)]
+        assert {stratum: expanded.count(stratum) for stratum in set(expanded)} == {
+            stratum: 32 for stratum in set(strata)
+        }
+
+
+def test_rl_repeat_and_dp_chunk_shape_mixes_anchors_locally_and_lengths_globally(tmp_path):
+    output = write_rl_prompt_bank(
+        tmp_path / "train.jsonl",
+        prompt_lengths=[2, 4],
+        repeats_per_length=4,
+        prompt_anchors=[PromptAnchor("left", 1), PromptAnchor("right", 9)],
+        reference_sequence="AAAACCCCGGGGTTTT",
+    )
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    expanded = [record for record in records for _ in range(16)]
+    dp_chunks = [expanded[start : start + 32] for start in range(0, 256, 32)]
+
+    assert len({row["messages"][0]["content"] for row in expanded}) == 4
+    for chunk in dp_chunks:
+        prompts = {row["messages"][0]["content"] for row in chunk}
+        assert len(prompts) == 2
+        assert len({len(prompt) for prompt in prompts}) == 1
+
+
+def test_write_prompt_sweep_mixes_anchors_within_each_length_file(tmp_path):
+    paths = write_prompt_sweep_jsonl(
+        tmp_path,
+        prompt_lengths=[2, 4],
+        num_prompts=2,
+        prompt_anchors=[PromptAnchor("left", 1), PromptAnchor("right", 9)],
+        reference_sequence="AAAACCCCGGGGTTTT",
+        id_prefix="test",
+    )
+
+    assert [path.name for path in paths] == ["test_prompt2_4.jsonl", "test_prompt4_4.jsonl"]
+    records = [json.loads(line) for line in paths[0].read_text().splitlines()]
+    assert [row["prompt"] for row in records] == ["+~AA", "+~GG", "+~AA", "+~GG"]
+    assert [row["id"] for row in records] == [
+        "test-left-p2-0000",
+        "test-right-p2-0000",
+        "test-left-p2-0001",
+        "test-right-p2-0001",
+    ]
+
+
+def test_write_prompt_sweep_deduplicates_lengths_without_changing_rl_weighting(tmp_path):
+    paths = write_prompt_sweep_jsonl(
+        tmp_path,
+        prompt_lengths=[2, 4, 4, 4],
+        num_prompts=2,
+        reference_start="AAAACCCCGGGGTTTT",
+        id_prefix="test",
+    )
+
+    assert [path.name for path in paths] == ["test_prompt2_2.jsonl", "test_prompt4_2.jsonl"]
+    records = [json.loads(line) for line in paths[1].read_text().splitlines()]
+    assert len(records) == len({record["id"] for record in records}) == 2
+
+    rl_path = write_rl_prompt_bank(
+        tmp_path / "rl.jsonl",
+        prompt_lengths=[2, 4, 4, 4],
+        repeats_per_length=1,
+        reference_start="AAAACCCCGGGGTTTT",
+    )
+    rl_records = [json.loads(line) for line in rl_path.read_text().splitlines()]
+    assert [len(record["messages"][0]["content"]) - 2 for record in rl_records] == [2, 4, 4, 4]
+
+
+def test_write_rotated_reference_fasta_materializes_invariance_controls(tmp_path):
+    reference = tmp_path / "reference.fasta"
+    reference.write_text(">reference\nAAAACCGG\n")
+
+    output = write_rotated_reference_fasta(
+        reference,
+        tmp_path / "rotations.fasta",
+        [PromptAnchor("origin", 1), PromptAnchor("wrap", 7)],
+    )
+
+    records = {
+        line[1:]: sequence
+        for line, sequence in zip(output.read_text().splitlines()[::2], output.read_text().splitlines()[1::2])
+    }
+    assert records == {"origin": "AAAACCGG", "wrap": "GGAAAACC"}
+    for sequence in records.values():
+        assert len(sequence) == 8
+        assert sorted(sequence) == sorted("AAAACCGG")
+    inverse_start = ((8 - (7 - 1)) % 8) + 1
+    assert circular_prompt(records["wrap"], PromptAnchor("inverse", inverse_start), 8, "") == "AAAACCGG"
+
+
+@pytest.mark.parametrize("command", ["write-rl-prompts", "write-prompts"])
+def test_generation_cli_rejects_reference_fasta_without_anchor(tmp_path, command):
+    reference = tmp_path / "reference.fasta"
+    reference.write_text(">reference\nAAAACCGG\n")
+    arguments = [
+        sys.executable,
+        "-m",
+        "bionemo.evo2_phage_gen.generation",
+        command,
+        "--reference-fasta",
+        str(reference),
+        "--prompt-lengths",
+        "4",
+    ]
+    if command == "write-rl-prompts":
+        arguments.extend(("--output", str(tmp_path / "prompts.jsonl"), "--repeats-per-length", "1"))
+    else:
+        arguments.extend(("--output-dir", str(tmp_path / "prompts"), "--num-prompts", "1"))
+
+    completed = subprocess.run(arguments, capture_output=True, text=True, check=False)
+
+    assert completed.returncode == 2
+    assert "--prompt-anchor is required with --reference-fasta" in completed.stderr
 
 
 def test_write_prompt_sweep_jsonl_repeats_prompts(tmp_path):
@@ -324,6 +496,81 @@ def test_final_rollout_reports_uninformative_constant_scores_without_nan(tmp_pat
     assert not diagnostic["strong_correlation"]
     assert not payload["ranking"]["applied_to_accepted_candidate_order"]
     assert (tmp_path / "report" / "accepted.fasta").read_text() == ">short\nA\n>long\nACG\n"
+
+
+@pytest.mark.parametrize("command", ["cluster-post-qc", "finalize-rollout", "enhanced-finalize"])
+@pytest.mark.parametrize("rotations,rc", [(True, True), (False, True), (True, False), (False, False)])
+def test_final_dedup_cli(monkeypatch, command, rotations, rc):
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured.update(kwargs)
+
+    if command == "cluster-post-qc":
+        monkeypatch.setattr(rollout_evidence, "cluster_post_qc_fasta", capture)
+        args = "cluster-post-qc --input-fasta input --output-fasta output --memberships-csv members --report report --work-dir work".split()
+    else:
+        args = "finalize-rollout --generated-fasta input --safety-manifest safety --target-fasta target --likelihood-csv scores --output-json output --accepted-fasta accepted --summary summary --model-checkpoint sft".split()
+        if command == "enhanced-finalize":
+            monkeypatch.setattr(rollout_evidence, "finalize_rollout_report", capture)
+            args += "--deduplication-mapping mapping --diagnostic-fasta diag --cluster-representatives-fasta reps --cluster-memberships members --rl-checkpoint rl".split()
+        else:
+            monkeypatch.setattr(generation, "finalize_ranked_rollout", capture)
+    args += [
+        "--deduplicate-rotations" if rotations else "--no-deduplicate-rotations",
+        "--deduplicate-reverse-complements" if rc else "--no-deduplicate-reverse-complements",
+    ]
+    monkeypatch.setattr(sys, "argv", ["evo2_phage_generation", *args])
+    generation.main()
+    assert captured["deduplicate_rotations"] is rotations
+    assert captured["deduplicate_reverse_complements"] is rc
+
+
+def test_ranked_rollout_circular_selection(tmp_path):
+    """Only eligible records may represent rotation/RC-equivalent order candidates."""
+    generated = tmp_path / "generated.fasta"
+    records = [
+        ("unsafe", "AACG"),
+        ("not-target", "ACGA"),
+        ("chosen", "CGTT"),
+        ("rotation", "GTTC"),
+        ("other", "GGTT"),
+        ("exact", "CGTT"),
+    ]
+    generated.write_text("".join(f">{name}\n{sequence}\n" for name, sequence in records))
+    safety = tmp_path / "safety.json"
+    safety.write_text(
+        json.dumps(
+            {"records": [{"record_id": name, "state": "FAIL" if name == "unsafe" else "PASS"} for name, _ in records]}
+        )
+    )
+    target = tmp_path / "target.fasta"
+    target.write_text(">t1\nCGTT\n>t2\nGTTC\n>t3\nGGTT\n")
+    scores = tmp_path / "scores.csv"
+    scores.write_text(
+        "record_id,scored_nucleotides,total_log_probability,mean_log_probability_per_nucleotide\n"
+        + "".join(f"{name},4,-4,-1\n" for name, _ in records)
+    )
+    report = tmp_path / "report.json"
+    accepted = tmp_path / "accepted.fasta"
+    finalize_ranked_rollout(
+        generated,
+        safety,
+        target,
+        scores,
+        report,
+        accepted,
+        tmp_path / "SUMMARY.md",
+        model_checkpoint="sft",
+    )
+    assert accepted.read_text() == ">chosen\nCGTT\n>other\nGGTT\n"
+    payload = json.loads(report.read_text())
+    assert payload["counts"]["accepted"] == 2
+    rows = {row["record_id"]: row for row in payload["records"]}
+    assert not rows["not-target"]["target_profile_pass"]
+    assert not rows["unsafe"]["accepted"]
+    assert rows["rotation"]["duplicate_of_higher_priority_candidate"] == "chosen"
+    assert rows["exact"]["duplicate_of_higher_priority_candidate"] == "chosen"
 
 
 def test_final_rollout_allows_zero_target_passes(tmp_path):
